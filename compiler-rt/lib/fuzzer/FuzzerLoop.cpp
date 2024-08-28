@@ -505,9 +505,32 @@ static void WriteEdgeToMutationGraphFile(const std::string &MutationGraphFile,
   AppendToFile(OutputString, MutationGraphFile);
 }
 
+// Seed distance is the average distances from basic blocks in the input's
+// execution trace to the target basic blocks 
+double getSeedDistance(InputCorpus &Corpus) {
+  double TraceLength = (double) __libfuzzer_directed_counter;
+  double TraceDistanceSum = (double) __libfuzzer_directed_accumulator;
+  double SeedDistance = TraceLength != 0 ? TraceDistanceSum / TraceLength : 0.0;
+  printf("RESULT %f\t/ %f\t= %f\n", TraceDistanceSum, TraceLength, SeedDistance);
+  __libfuzzer_directed_counter = 0;
+  __libfuzzer_directed_accumulator = 0;
+  if (SeedDistance > 0) {
+    // Initially, min == max == -1.0, so set to first seed distance seen
+    if (Corpus.MinSeedDistance == -1.0) {
+      Corpus.MinSeedDistance = Corpus.MaxSeedDistance = SeedDistance;
+    }
+    else {
+      Corpus.MinSeedDistance = std::min(Corpus.MinSeedDistance, SeedDistance);
+      Corpus.MaxSeedDistance = std::max(Corpus.MaxSeedDistance, SeedDistance);
+    }
+  }
+  return SeedDistance;
+}
+
 bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
                     InputInfo *II, bool ForceAddToCorpus,
                     bool *FoundUniqFeatures) {
+  printf("RunOne II: %p, %s\n", II, Data);
   if (!Size)
     return false;
   // Largest input length should be INT_MAX.
@@ -531,9 +554,16 @@ bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
   });
   if (FoundUniqFeatures)
     *FoundUniqFeatures = FoundUniqFeaturesOfII;
+  
+  double SeedDistance = getSeedDistance(Corpus);
+  (void) Corpus.getDistancePowerFactor(SeedDistance, Data);
+  if (II)
+    II->SeedDistance = SeedDistance;
+
   PrintPulseAndReportSlowInput(Data, Size);
   size_t NumNewFeatures = Corpus.NumFeatureUpdates() - NumUpdatesBefore;
   if (NumNewFeatures || ForceAddToCorpus) {
+    printf("NumNewFeatures II: %p, %d\n", II, NumNewFeatures);
     TPC.UpdateObservedPCs();
     auto NewII =
         Corpus.AddToCorpus({Data, Data + Size}, NumNewFeatures, MayDeleteFile,
@@ -549,6 +579,7 @@ bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
       II->DataFlowTraceForFocusFunction.empty() &&
       FoundUniqFeaturesOfII == II->UniqFeatureSet.size() &&
       II->U.size() > Size) {
+    printf("Other II: %p\n", II);
     auto OldFeaturesFile = Sha1ToString(II->Sha1);
     Corpus.Replace(II, {Data, Data + Size}, TimeOfUnit);
     RenameFeatureSetFile(Options.FeaturesDir, OldFeaturesFile,
@@ -824,6 +855,7 @@ void Fuzzer::ReadAndExecuteSeedCorpora(std::vector<SizedFile> &CorporaFiles) {
 
     // Load and execute inputs one by one.
     for (auto &SF : CorporaFiles) {
+      printf("SF: %s\n", SF.File.c_str());
       auto U = FileToVector(SF.File, MaxInputLen, /*ExitOnError=*/false);
       assert(U.size() <= MaxInputLen);
       RunOne(U.data(), U.size(), /*MayDeleteFile*/ false, /*II*/ nullptr,

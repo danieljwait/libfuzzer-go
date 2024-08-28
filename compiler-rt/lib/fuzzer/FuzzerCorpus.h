@@ -23,6 +23,11 @@
 #include <numeric>
 #include <random>
 #include <unordered_set>
+#include <chrono>
+#include <fstream>
+
+extern long long __libfuzzer_directed_accumulator;
+extern long long __libfuzzer_directed_counter;
 
 namespace fuzzer {
 
@@ -33,6 +38,7 @@ struct InputInfo {
   // Number of features that this input has and no smaller input has.
   size_t NumFeatures = 0;
   size_t Tmp = 0; // Used by ValidateFeatureSet.
+  double SeedDistance = 0.0;
   // Stats.
   size_t NumExecutedMutations = 0;
   size_t NumSuccessfullMutations = 0;
@@ -172,6 +178,18 @@ public:
     for (auto II : Inputs)
       delete II;
   }
+
+  double MinSeedDistance = -1.0;
+  double MaxSeedDistance = -1.0;
+  uint32_t TimeToExploitationMins = std::chrono::minutes(10).count();
+  enum CoolingSchedule {
+    SAN_EXP,
+    SAN_LOG,
+    SAN_LIN,
+    SAN_QUAD
+  };
+  CoolingSchedule CoolingSchedule = SAN_EXP;
+
   size_t size() const { return Inputs.size(); }
   size_t SizeInBytes() const {
     size_t Res = 0;
@@ -468,9 +486,75 @@ public:
   size_t NumFeatures() const { return NumAddedFeatures; }
   size_t NumFeatureUpdates() const { return NumUpdatedFeatures; }
 
+  double getDistancePowerFactor(double SeedDistance, const uint8_t *Data=nullptr) {
+    uint64_t CurrentTimeMs
+      = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()
+          ).count();
+    uint64_t ElapsedMilliseconds = CurrentTimeMs - StartTimeMs;
+    uint64_t ElapsedSeconds = ElapsedMilliseconds / 1000;
+    double Progress = ((double) ElapsedSeconds) / ((double) TimeToExploitationMins * 60.0);
+ 
+    // Calculate global temperature with chosen cooling schedule.
+    double Temperature;
+    switch (CoolingSchedule) {
+      case SAN_EXP:
+        Temperature = 1.0 / pow(20.0, Progress);
+        break;
+      case SAN_LOG: // Natural log
+        // alpha = 2 and exp(19/2) - 1 = 13358.7268297
+        Temperature = 1.0 / (1.0 + 2.0 * log(1.0 + Progress * 13358.7268297));
+        break;
+      case SAN_LIN:
+        Temperature = 1.0 / (1.0 + 19.0 * Progress);
+        break;
+      case SAN_QUAD:
+        Temperature = 1.0 / (1.0 + 19.0 * pow(Progress, 2));
+        break;
+      default:
+        assert(false && "Unknown Power Schedule for Directed Fuzzing");
+    }
+
+    // Calculate normalized seed distance
+    double NormSeedDistance;
+    if (MaxSeedDistance == MinSeedDistance)
+      NormSeedDistance = 0;
+    else
+      NormSeedDistance = (SeedDistance - MinSeedDistance) / (MaxSeedDistance - MinSeedDistance);
+
+    // Calculate power (and apply) factor
+    if (NormSeedDistance >= 0) {
+      double p = (1.0 - NormSeedDistance) * (1.0 - Temperature) + 0.5 * Temperature;
+      double PowerFactor = pow(2.0, 2.0 * (double) log2(MAX_FACTOR) * (p - 0.5));
+      // II->Energy *= PowerFactor;
+
+      if (Data) {
+        printf("RESULT %4lf - %s\n", SeedDistance, Data);
+        exit(0);
+
+        // Printf("[Time %4ld] "
+        //       "distance: %4lf [%4lf, %4lf], "
+        //       "T: %4.3lf, "
+        //       "power_factor: %4.3lf, "
+        //       "energy: %4.3lf (%s)\n",
+        // ElapsedSeconds, II->SeedDistance, MinSeedDistance, MaxSeedDistance, Temperature, PowerFactor, II->Energy * PowerFactor, II->U.data());
+      }
+
+      return PowerFactor;
+    }
+    else
+      assert(false && "Seed distance is negative");
+      return -1;
+  }
+
 private:
 
   static const bool FeatureDebug = false;
+
+  uint64_t StartTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+  static const int MAX_FACTOR = 32;
 
   uint32_t GetFeature(size_t Idx) const { return InputSizesPerFeature[Idx]; }
 
@@ -523,6 +607,7 @@ private:
           II->UpdateEnergy(RareFeatures.size(), Entropic.ScalePerExecTime,
                            AverageUnitExecutionTime);
         }
+        II->Energy *= getDistancePowerFactor(II->SeedDistance);
       }
 
       for (size_t i = 0; i < N; i++) {

@@ -17,6 +17,8 @@
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/EHPersonalities.h"
 #include "llvm/IR/Function.h"
@@ -34,6 +36,8 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <fstream>
+#include <map>
 
 using namespace llvm;
 
@@ -152,6 +156,17 @@ static cl::opt<bool>
     ClCollectCF("sanitizer-coverage-control-flow",
                 cl::desc("collect control flow for each function"), cl::Hidden);
 
+/*
+// For instrumentation
+static cl::opt<std::string> DistanceFile(
+    "distance",
+    cl::desc("Distance file containing the distance of each basic block to the provided targets."),
+    cl::value_desc("filename")
+);
+
+std::map<std::string, int> BBDistances; // FIXME: being global is temp solution
+//*/
+
 namespace {
 
 SanitizerCoverageOptions getOptions(int LegacyCoverageLevel) {
@@ -250,6 +265,12 @@ private:
   std::string getSectionName(const std::string &Section) const;
   std::string getSectionStart(const std::string &Section) const;
   std::string getSectionEnd(const std::string &Section) const;
+
+/*
+  std::string AccumulatorName = "__libfuzzer_directed_accumulator";
+  std::string CounterName = "__libfuzzer_directed_counter";
+  void AddDirectedGlobals(IRBuilder<> &IRB);
+//*/
 
   Module &M;
   DomTreeCallback DTCallback;
@@ -370,6 +391,59 @@ Function *ModuleSanitizerCoverage::CreateInitCallsForSections(
   return CtorFunc;
 }
 
+/*
+void LoadBBDistances(std::map<std::string, int> &BBDistances) {
+  if (DistanceFile.empty()) {
+    llvm::errs() << "DistanceFile is empty\n";
+    exit(-1);
+    return;
+  }
+  std::ifstream DistanceStream(DistanceFile);
+  if (!DistanceStream.is_open()) {
+    llvm::errs() << "Unable to find DistanceFile\n";
+    exit(-1);
+    return;
+  }
+  std::string Line;
+  while (getline(DistanceStream, Line)) {
+    std::size_t Pos = Line.find(",");
+    std::string BBName = Line.substr(0, Pos);
+    int BBDist = (int) (100.0 * atof(Line.substr(Pos + 1, Line.length()).c_str()));
+    BBDistances.emplace(BBName, BBDist);
+  }
+  DistanceStream.close();
+
+  // // BEGIN DEBUG
+  // llvm::errs() << "Parsed contents of distance.cfg.txt:\n";
+  // for (auto &BBDist : BBDistances) {
+  //   llvm::errs() << "\t" << BBDist.first << " - " << BBDist.second << "\n";
+  // }
+  // llvm::errs() << "\n";
+  // // END DEBUG
+}
+
+
+void ModuleSanitizerCoverage::AddDirectedGlobals(IRBuilder<> &IRB) {
+  // 64-bit accumulator for total BB distance
+  M.getOrInsertGlobal(AccumulatorName, Int64Ty);
+  GlobalVariable *AccumulatorVar = M.getNamedGlobal(AccumulatorName);
+  AccumulatorVar->setLinkage(GlobalValue::ExternalLinkage);
+  // if (M.getFunction("LLVMFuzzerTestOneInput")) {
+  //   AccumulatorVar->setInitializer(IRB.getInt64(0));
+  // }
+  AccumulatorVar->setConstant(false);
+
+  // 64-bit counter for number of BBs hit
+  M.getOrInsertGlobal(CounterName, Int64Ty);
+  GlobalVariable *CounterVar = M.getNamedGlobal(CounterName);
+  CounterVar->setLinkage(GlobalValue::ExternalLinkage);
+  // if (M.getFunction("LLVMFuzzerTestOneInput")) {
+  //   CounterVar->setInitializer(IRB.getInt64(0));
+  // }
+  CounterVar->setConstant(false);
+}
+//*/
+
 bool ModuleSanitizerCoverage::instrumentModule() {
   if (Options.CoverageType == SanitizerCoverageOptions::SCK_None)
     return false;
@@ -481,6 +555,9 @@ bool ModuleSanitizerCoverage::instrumentModule() {
   SanCovTracePC = M.getOrInsertFunction(SanCovTracePCName, VoidTy);
   SanCovTracePCGuard =
       M.getOrInsertFunction(SanCovTracePCGuardName, VoidTy, PtrTy);
+
+  // LoadBBDistances(BBDistances);
+  // AddDirectedGlobals(IRB);
 
   for (auto &F : M)
     instrumentFunction(F);
@@ -957,8 +1034,65 @@ void ModuleSanitizerCoverage::InjectCoverageAtBlock(Function &F, BasicBlock &BB,
   }
 
   InstrumentationIRBuilder IRB(&*IP);
-  if (EntryLoc)
+  if (EntryLoc) {
     IRB.SetCurrentDebugLocation(EntryLoc);
+  }
+    /* // put if-statement above
+    printf("Function name: %s\n", F.getName().str().c_str());
+    if (F.getName().str() == "LLVMFuzzerTestOneInput") {
+      printf("Initialising globals\n");
+      GlobalVariable *AccumulatorVar = F.getParent()->getNamedGlobal(AccumulatorName);
+      AccumulatorVar->setInitializer(IRB.getInt64(0));
+      GlobalVariable *CounterVar = F.getParent()->getNamedGlobal(CounterName);
+      CounterVar->setInitializer(IRB.getInt64(0));
+    }
+  }
+
+  // Get BBName (filename:line) for the current basic block
+  std::string BBName;
+  for (auto &Inst : BB) {
+    llvm::DebugLoc debugInfo = Inst.getDebugLoc();
+    if (debugInfo.get()) {
+      llvm::StringRef filename = debugInfo->getFilename();
+      int line = debugInfo->getLine();
+      if (filename.empty() || line == 0) {
+        continue;
+      }
+      std::size_t found = filename.find_last_of("/\\");
+      if (found != std::string::npos)
+        filename = filename.substr(found + 1);
+      BBName = filename.str() + ":" + std::to_string(line);
+      break;
+    }
+  }
+  
+  // // Print the BBName and the distance
+  // if (!BBName.empty()) {
+  //     if (BBDistances.find(BBName) != BBDistances.end()) {
+  //       int Distance = BBDistances[BBName];
+  //       llvm::errs() << "\t" << BBName << " - " << Distance << "\n";
+  //     }
+  //     else {
+  //       llvm::errs() << "\t" << BBName << " - unknown distance\n";
+  //     }
+  // }
+
+  if (!BBName.empty() && BBDistances.find(BBName) != BBDistances.end()) {
+    printf("Instrumenting block %s\n", BBName.c_str());
+    GlobalVariable *AccVar = M.getNamedGlobal(AccumulatorName);
+    auto AccLoad = IRB.CreateLoad(Int64Ty, AccVar);
+    auto AccAdd = IRB.CreateAdd(AccLoad, ConstantInt::get(Int64Ty, BBDistances[BBName]));
+    IRB.CreateStore(AccAdd, AccVar);
+
+    GlobalVariable *CountVar = M.getNamedGlobal(CounterName);
+    auto CountLoad = IRB.CreateLoad(Int64Ty, CountVar);
+    auto CountInc = IRB.CreateAdd(CountLoad, ConstantInt::get(Int64Ty, 1));
+    IRB.CreateStore(CountInc, CountVar);
+  } else {
+    printf("Skip %s\n", BBName.c_str());
+  }
+  //*/
+
   if (Options.TracePC) {
     IRB.CreateCall(SanCovTracePC)
         ->setCannotMerge(); // gets the PC using GET_CALLER_PC.

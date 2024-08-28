@@ -68,6 +68,7 @@
 #include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
 #include "llvm/Transforms/Instrumentation/BoundsChecking.h"
+#include "llvm/Transforms/Instrumentation/DirectedFuzzing.h"
 #include "llvm/Transforms/Instrumentation/DataFlowSanitizer.h"
 #include "llvm/Transforms/Instrumentation/GCOVProfiler.h"
 #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
@@ -664,6 +665,7 @@ static void addSanitizers(const Triple &TargetTriple,
                           const LangOptions &LangOpts, PassBuilder &PB) {
   auto SanitizersCallback = [&](ModulePassManager &MPM,
                                 OptimizationLevel Level) {
+    // MPM.addPass(DirectedFuzzingPass());
     if (CodeGenOpts.hasSanitizeCoverage()) {
       auto SancovOpts = getSancovOptsFromCGOpts(CodeGenOpts);
       MPM.addPass(SanitizerCoveragePass(
@@ -946,6 +948,8 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
   if (CodeGenOpts.VerifyModule)
     MPM.addPass(VerifierPass());
 
+  // MPM.addPass(DirectedFuzzingPass());
+
   if (!CodeGenOpts.DisableLLVMPasses) {
     // Map our optimization levels into one of the distinct levels used to
     // configure the pipeline.
@@ -995,6 +999,8 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
             FPM.addPass(BoundsCheckingPass());
           });
 
+    MPM.addPass(DirectedFuzzingPass());
+
     // Don't add sanitizers if we are here from ThinLTO PostLink. That already
     // done on PreLink stage.
     if (!IsThinLTOPostLink) {
@@ -1037,6 +1043,8 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
       MPM.addPass(PB.buildPerModuleDefaultPipeline(Level));
     }
   }
+
+  // MPM.addPass(DirectedFuzzingPass());
 
   // Link against bitcodes supplied via the -mlink-builtin-bitcode option
   if (CodeGenOpts.LinkBitcodePostopt)
